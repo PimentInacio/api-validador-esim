@@ -1,95 +1,91 @@
 from fastapi import FastAPI
 from duckduckgo_search import DDGS
+import requests
+from bs4 import BeautifulSoup
 import logging
-import time
+import re
 
 app = FastAPI()
 
-# Configuração de logs
+# Configuração de Logs
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ValidadorESIM")
+logger = logging.getLogger("ColetorSpecs")
 
-def search_esim_capability(model_name: str):
-    logger.info(f"Validando: {model_name}")
+# Headers para fingir que somos um navegador (evita bloqueio 403 do GSMArena)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
+def get_page_content(url):
+    try:
+        # Timeout curto (3s) para não travar sua automação
+        response = requests.get(url, headers=HEADERS, timeout=3)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Remove scripts e estilos para limpar o texto
+            for script in soup(["script", "style", "nav", "footer"]):
+                script.decompose()
+            
+            # Pega o texto e limpa espaços extras
+            text = soup.get_text(separator=' ')
+            clean_text = re.sub(r'\s+', ' ', text).strip()
+            
+            # Corta em 3500 caracteres (suficiente para a IA e economiza tokens)
+            return clean_text[:3500]
+    except Exception as e:
+        logger.error(f"Erro ao ler site {url}: {e}")
+    return None
+
+def search_specs(model_name: str):
+    logger.info(f"Buscando specs para: {model_name}")
     
-    # Query focada: Tenta forçar o aparecimento da palavra eSIM junto com o site GSMArena
-    query = f"{model_name} gsmarena specs esim"
+    # Busca focada em ficha técnica
+    query = f"{model_name} specs gsmarena phonearena devicespecifications"
     
     results = []
-    backend_used = "none"
-
-    # TENTATIVA 1: Backend HTML (Mais robusto)
     try:
-        logger.info("Tentando backend HTML...")
-        # O backend html simula um navegador real
+        # Tenta modo HTML (mais robusto)
         results = list(DDGS().text(keywords=query, max_results=5, backend="html"))
-        backend_used = "html"
-    except Exception as e:
-        logger.error(f"Erro HTML: {e}")
-
-    # TENTATIVA 2: Backend Lite (Se o HTML falhar ou vier vazio)
-    if not results:
+    except:
         try:
-            logger.info("Tentando backend Lite (Fallback)...")
-            time.sleep(1) # Respira 1 segundo pra não parecer spam
+            # Fallback para Lite
             results = list(DDGS().text(keywords=query, max_results=5, backend="lite"))
-            backend_used = "lite"
         except Exception as e:
-            logger.error(f"Erro Lite: {e}")
+            return {"error": str(e), "content": ""}
 
-    # Se depois das duas tentativas ainda estiver vazio
     if not results:
-        return {
-            "compatible": 0, 
-            "reason": "Bloqueio de IP ou sem resultados nos dois modos.",
-            "backend_attempted": backend_used
-        }
+        return {"content": "Nenhum resultado de busca encontrado."}
 
-    # ANÁLISE DOS RESULTADOS
-    found_snippets = []
+    # Estratégia: Tentar ler o conteúdo do 1º site técnico que encontrar
+    full_content = ""
+    source_url = ""
 
     for result in results:
-        body = result.get('body', '').lower()
-        title = result.get('title', '').lower()
-        url = result.get('href', '').lower()
+        url = result.get('href', '')
         
-        # Guarda um pedacinho pra gente ver o que ele leu (Debug)
-        found_snippets.append(body[:150])
-
-        # Verificações
-        has_esim = 'esim' in body or 'embedded sim' in body
+        # Tenta entrar no site e pegar o texto real
+        page_text = get_page_content(url)
         
-        # Só nega se disser explicitamente "NO eSIM"
-        has_negative = 'no esim' in body
+        if page_text and len(page_text) > 500:
+            full_content = page_text
+            source_url = url
+            break # Achou um bom texto? Para e retorna ele.
+    
+    # Se não conseguiu entrar em nenhum site (bloqueio), junta os resumos (snippets)
+    if not full_content:
+        logger.warning("Falha ao ler sites. Usando snippets.")
+        snippets = [r.get('body', '') for r in results]
+        full_content = " | ".join(snippets)
+        source_url = "DuckDuckGo Snippets (Leitura falhou)"
 
-        if has_esim and not has_negative:
-            # SUCESSO!
-            return {
-                "compatible": 1,
-                "model": model_name,
-                "confidence": "high",
-                "source": url,
-                "evidence": body,
-                "backend": backend_used
-            }
-
-    # Se leu os textos e não achou a palavra eSIM
     return {
-        "compatible": 0,
         "model": model_name,
-        "reason": "Resultados encontrados, mas a palavra eSIM não estava neles.",
-        "backend": backend_used,
-        "debug_snippets": found_snippets
+        "source": source_url,
+        "content_length": len(full_content),
+        "raw_text": full_content
     }
-
-@app.get("/")
-def home():
-    return {"status": "Online", "version": "V4 - Dual Backend"}
 
 @app.get("/check")
 def check(model: str):
-    return search_esim_capability(model)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=80)
+    return search_specs(model)
