@@ -4,86 +4,69 @@ import logging
 
 app = FastAPI()
 
-# Configuração de logs
+# Logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ValidadorESIM")
-
-# LISTA VIP: Sites que confiamos 100%
-TRUSTED_DOMAINS = [
-    "gsmarena.com", 
-    "airalo.com", 
-    "holafly.com", 
-    "apple.com", 
-    "samsung.com", 
-    "motorola.com", 
-    "mi.com", 
-    "devicespecifications.com",
-    "tudocelular.com", 
-    "tecmundo.com.br", 
-    "kimovil.com"
-]
 
 def search_esim_capability(model_name: str):
     logger.info(f"Validando: {model_name}")
     
-    # Busca técnica aberta
-    query = f"{model_name} technical specifications esim support"
+    # === MUDANÇA PRINCIPAL AQUI ===
+    # Em vez de buscar na internet toda, vamos direto na fonte técnica.
+    # Adicionamos 'gsmarena' para pegar o snippet técnico que sempre diz "Nano-SIM and eSIM"
+    query = f"{model_name} gsmarena specs esim"
     
     try:
-        # Busca até 10 resultados
-        results = DDGS().text(keywords=query, max_results=10, backend="html")
+        # Puxamos 5 resultados. O backend 'api' costuma trazer snippets melhores.
+        results = DDGS().text(keywords=query, max_results=5, backend="api")
     except Exception as e:
-        logger.error(f"Erro DuckDuckGo: {e}")
         return {"compatible": 0, "error": str(e)}
 
     if not results:
         return {"compatible": 0, "reason": "Sem resultados"}
 
-    esim_confirmed = False
-    trusted_source_found = False
-    evidence_text = ""
-    source_url = ""
+    # Debug: Vamos guardar o que ele achou pra você ver se der erro
+    found_snippets = []
 
     for result in results:
         body = result.get('body', '').lower()
+        title = result.get('title', '').lower()
         url = result.get('href', '').lower()
+        
+        found_snippets.append(body[:100]) # Guarda o começo do texto pra debug
 
-        # 1. É site VIP?
-        is_vip = any(domain in url for domain in TRUSTED_DOMAINS)
+        # Palavras-chave de sucesso
+        has_esim = 'esim' in body or 'embedded sim' in body
+        
+        # Palavras-chave de fracasso (apenas se for explícito que NÃO tem)
+        # Removemos 'nano-sim' da negativa porque celulares modernos têm OS DOIS.
+        has_negative = 'no esim' in body
 
-        # 2. Tem termos positivos?
-        has_positive = 'esim' in body or 'embedded sim' in body or 'e-sim' in body
+        if has_esim and not has_negative:
+            # BINGO!
+            return {
+                "compatible": 1,
+                "model": model_name,
+                "source": url,
+                "evidence": body
+            }
 
-        # 3. Tem termos negativos (pra evitar falso positivo)?
-        has_negative = ('no esim' in body or 'not support esim' in body or 'nano-sim only' in body)
-
-        if has_positive and not has_negative:
-            esim_confirmed = True
-            evidence_text = body
-            source_url = url
-            if is_vip:
-                trusted_source_found = True
-                break # Achou no VIP, encerra e confirma.
-
-    if esim_confirmed:
-        return {
-            "compatible": 1,
-            "model": model_name,
-            "confidence": "high" if trusted_source_found else "medium",
-            "source": source_url,
-            "evidence": evidence_text
-        }
-    else:
-        return {
-            "compatible": 0,
-            "model": model_name,
-            "reason": "Nenhuma menção explícita encontrada"
-        }
+    # Se chegou aqui, não achou. Vamos retornar o que ele leu pra gente entender o erro.
+    return {
+        "compatible": 0,
+        "model": model_name,
+        "reason": "Não encontrei a palavra eSIM nos resultados.",
+        "debug_snippets": found_snippets
+    }
 
 @app.get("/")
 def home():
-    return {"status": "Online", "service": "Validador eSIM V2"}
+    return {"status": "Online", "version": "V3 - GSMArena Focus"}
 
 @app.get("/check")
 def check(model: str):
     return search_esim_capability(model)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=80)
